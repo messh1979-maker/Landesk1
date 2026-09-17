@@ -101,7 +101,7 @@ def screen_sender(channel, stop_event, fps, bitrate, max_dim):
                 pts += 1
 
                 for packet in encoder.encode(frame):
-                    channel.send(MSG_FRAME, packet.to_bytes())
+                    channel.send(MSG_FRAME, bytes(packet))
             except OSError:
                 stop_event.set()
                 break
@@ -115,7 +115,7 @@ def screen_sender(channel, stop_event, fps, bitrate, max_dim):
     if encoder is not None:
         try:
             for packet in encoder.encode(None):  # flush
-                channel.send(MSG_FRAME, packet.to_bytes())
+                channel.send(MSG_FRAME, bytes(packet))
         except Exception:
             pass
 
