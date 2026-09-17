@@ -3,14 +3,18 @@
 host.py - runs on the machine you want to control remotely.
 
 Connects OUT to the proxy (so it works from behind NAT with no port
-forwarding needed), registers a random 6-digit code, then streams the
-screen to whoever the proxy pairs it with -- encoded as a real H.265
-(HEVC) video stream via PyAV/libx265, not per-frame JPEGs -- and
-applies the mouse/keyboard commands it receives back.
+forwarding needed), registers a random 6-digit code, then -- once a
+viewer pairs -- runs an end-to-end encrypted handshake directly with
+that viewer (see secure_channel.py; the proxy never sees the key) and
+streams the screen as a real H.265 (HEVC) video stream via PyAV/
+libx265, applying the mouse/keyboard commands it receives back.
 
 Only run this on a machine you own or are explicitly authorized to
-control, and only give the code out to people you trust -- see the
-README for the security caveats of this prototype.
+control, and only give the code out to people you trust. After
+pairing, this prints a 6-digit SAS -- read it to the person on the
+viewer side (or send it over a channel you trust) and make sure it
+matches what their window shows before you assume the connection is
+safe. See the README for the full security notes.
 
 Usage:
     python host.py --proxy-host 203.0.113.10 --proxy-port 5000 \
@@ -29,6 +33,8 @@ import mss
 import pyautogui
 from PIL import Image
 
+from secure_channel import SecureChannel, HandshakeError
+
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0
 
@@ -37,33 +43,6 @@ MSG_MOUSE_MOVE = 0x02
 MSG_MOUSE_CLICK = 0x03
 MSG_KEY = 0x04
 MSG_SCROLL = 0x05
-
-
-def send_msg(sock, lock, msg_type, payload=b""):
-    packet = struct.pack("!BI", msg_type, len(payload)) + payload
-    with lock:
-        sock.sendall(packet)
-
-
-def recv_exact(sock, n):
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            return None
-        buf.extend(chunk)
-    return bytes(buf)
-
-
-def recv_msg(sock):
-    header = recv_exact(sock, 5)
-    if header is None:
-        return None, None
-    msg_type, length = struct.unpack("!BI", header)
-    payload = recv_exact(sock, length) if length else b""
-    if payload is None:
-        return None, None
-    return msg_type, payload
 
 
 def make_encoder(width, height, fps, bitrate):
@@ -91,7 +70,7 @@ def make_encoder(width, height, fps, bitrate):
     return encoder
 
 
-def screen_sender(sock, lock, stop_event, fps, bitrate, max_dim):
+def screen_sender(channel, stop_event, fps, bitrate, max_dim):
     frame_interval = 1.0 / fps
     encoder = None
     pts = 0
@@ -122,7 +101,7 @@ def screen_sender(sock, lock, stop_event, fps, bitrate, max_dim):
                 pts += 1
 
                 for packet in encoder.encode(frame):
-                    send_msg(sock, lock, MSG_FRAME, packet.to_bytes())
+                    channel.send(MSG_FRAME, packet.to_bytes())
             except OSError:
                 stop_event.set()
                 break
@@ -136,7 +115,7 @@ def screen_sender(sock, lock, stop_event, fps, bitrate, max_dim):
     if encoder is not None:
         try:
             for packet in encoder.encode(None):  # flush
-                send_msg(sock, lock, MSG_FRAME, packet.to_bytes())
+                channel.send(MSG_FRAME, packet.to_bytes())
         except Exception:
             pass
 
@@ -147,10 +126,16 @@ def denormalize(nx, ny, screen_w, screen_h):
     return max(0, min(screen_w - 1, x)), max(0, min(screen_h - 1, y))
 
 
-def input_receiver(sock, stop_event, screen_w, screen_h):
+def input_receiver(channel, stop_event, screen_w, screen_h):
     button_names = {0: "left", 1: "right", 2: "middle"}
     while not stop_event.is_set():
-        msg_type, payload = recv_msg(sock)
+        try:
+            msg_type, payload = channel.recv()
+        except HandshakeError as e:
+            print(f"[host] secure channel error, closing session: {e}")
+            stop_event.set()
+            break
+
         if msg_type is None:
             print("[host] connection closed by proxy/viewer")
             stop_event.set()
@@ -235,17 +220,28 @@ def main():
             sock.close()
             continue
 
-        print("[host] viewer connected. Streaming H.265...")
-        lock = threading.Lock()
-        stop_event = threading.Event()
+        try:
+            channel = SecureChannel.handshake_as_host(sock)
+        except (HandshakeError, OSError) as e:
+            print(f"[host] E2EE handshake failed: {e}")
+            sock.close()
+            continue
 
+        print("=" * 40)
+        print(f"  Verify this matches the viewer's code: {channel.sas}")
+        print("  (read it out, or confirm over a channel you trust --")
+        print("   if it doesn't match, someone may be intercepting you)")
+        print("=" * 40)
+        print("[host] viewer connected. Streaming H.265 (encrypted)...")
+
+        stop_event = threading.Event()
         t_send = threading.Thread(
             target=screen_sender,
-            args=(sock, lock, stop_event, args.fps, args.bitrate, args.max_dim),
+            args=(channel, stop_event, args.fps, args.bitrate, args.max_dim),
             daemon=True,
         )
         t_recv = threading.Thread(
-            target=input_receiver, args=(sock, stop_event, screen_w, screen_h), daemon=True
+            target=input_receiver, args=(channel, stop_event, screen_w, screen_h), daemon=True
         )
         t_send.start()
         t_recv.start()

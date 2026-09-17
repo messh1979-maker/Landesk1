@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
-viewer.py - connects to the proxy with a host's connection code and
-shows/controls that host's screen.
+viewer.py - connects to the proxy with a host's connection code, runs
+an end-to-end encrypted handshake with the host (see secure_channel.py
+-- the proxy never sees the key), and shows/controls that host's
+screen over the encrypted channel.
+
+After pairing this prints a 6-digit SAS in the window title. Compare
+it with the code the host prints before you trust the session -- if
+they don't match, someone may be intercepting the connection (even a
+malicious proxy can't make them match, since it can't compute the
+shared secret without the private keys).
 
 Usage:
     python viewer.py --proxy-host 203.0.113.10 --proxy-port 5000 --code 123456
@@ -15,6 +23,8 @@ import tkinter as tk
 import av
 from PIL import ImageTk
 
+from secure_channel import SecureChannel, HandshakeError
+
 MSG_FRAME = 0x01
 MSG_MOUSE_MOVE = 0x02
 MSG_MOUSE_CLICK = 0x03
@@ -22,35 +32,13 @@ MSG_KEY = 0x04
 MSG_SCROLL = 0x05
 
 
-def recv_exact(sock, n):
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            return None
-        buf.extend(chunk)
-    return bytes(buf)
-
-
-def recv_msg(sock):
-    header = recv_exact(sock, 5)
-    if header is None:
-        return None, None
-    msg_type, length = struct.unpack("!BI", header)
-    payload = recv_exact(sock, length) if length else b""
-    if payload is None:
-        return None, None
-    return msg_type, payload
-
-
 class Viewer:
-    def __init__(self, sock):
-        self.sock = sock
-        self.send_lock = threading.Lock()
+    def __init__(self, channel):
+        self.channel = channel
         self.stop_event = threading.Event()
 
         self.root = tk.Tk()
-        self.root.title("lan-desk viewer")
+        self.root.title(f"lan-desk viewer  —  verify code: {channel.sas}")
         self.label = tk.Label(self.root)
         self.label.pack()
         self.tk_img = None  # keep a reference or Tk garbage-collects the image
@@ -76,10 +64,8 @@ class Viewer:
         threading.Thread(target=self.recv_loop, daemon=True).start()
 
     def send_msg(self, msg_type, payload=b""):
-        packet = struct.pack("!BI", msg_type, len(payload)) + payload
         try:
-            with self.send_lock:
-                self.sock.sendall(packet)
+            self.channel.send(msg_type, payload)
         except OSError:
             self.stop_event.set()
 
@@ -128,7 +114,13 @@ class Viewer:
 
     def recv_loop(self):
         while not self.stop_event.is_set():
-            msg_type, payload = recv_msg(self.sock)
+            try:
+                msg_type, payload = self.channel.recv()
+            except HandshakeError as e:
+                print(f"[viewer] secure channel error, closing session: {e}")
+                self.stop_event.set()
+                break
+
             if msg_type is None:
                 print("[viewer] connection closed")
                 self.stop_event.set()
@@ -153,7 +145,7 @@ class Viewer:
     def on_close(self):
         self.stop_event.set()
         try:
-            self.sock.close()
+            self.channel.sock.close()
         except OSError:
             pass
         self.root.destroy()
@@ -177,8 +169,16 @@ def main():
         print(f"[viewer] could not connect: {reply!r}")
         return
 
-    print("[viewer] paired with host, opening window...")
-    Viewer(sock).run()
+    try:
+        channel = SecureChannel.handshake_as_viewer(sock)
+    except (HandshakeError, OSError) as e:
+        print(f"[viewer] E2EE handshake failed: {e}")
+        return
+
+    print("[viewer] paired with host.")
+    print(f"[viewer] verify this matches the host's printed code: {channel.sas}")
+    print("[viewer] opening window...")
+    Viewer(channel).run()
 
 
 if __name__ == "__main__":

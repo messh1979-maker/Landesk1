@@ -2,3 +2,4 @@ mss
 pillow
 pyautogui
 av
+cryptography
